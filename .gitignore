@@ -1,0 +1,4 @@
+*.c2
+play_spool
+pttkey_rec
+*.o
