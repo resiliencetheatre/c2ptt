@@ -25,15 +25,17 @@
  * [pttkey]
  * enable_keyboard=1
  * keyboard_device=/dev/input/event0
- * ptt_down_type = 1
- * ptt_down_code = 100
- * ptt_down_value = 1
- * ptt_up_type = 1
- * ptt_up_code = 100
- * ptt_up_value = 0
+ * ptt_down_type=1
+ * ptt_down_code=100
+ * ptt_down_value=1
+ * ptt_up_type=1
+ * ptt_up_code=100
+ * ptt_up_value=0
  *
  * enable_socket=1
  * socket_path=/tmp/pttkey.sock
+ *
+ * output_dir=/tmp/c2out
  *
  * Socket commands:
  *   ptt_down
@@ -59,6 +61,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <limits.h>
 
 #include <alsa/asoundlib.h>
 #include <codec2/codec2.h>
@@ -71,7 +74,7 @@
 #define CHANNELS    1
 
 struct c2_header {
-    char     magic[4];           /* "C2BF" */
+    char     magic[4];
     uint32_t mode;
     uint32_t bits_per_frame;
     uint32_t samples_per_frame;
@@ -130,6 +133,112 @@ static int parse_ini_int(const char *s, int defval)
     if (!s || !*s)
         return defval;
     return atoi(s);
+}
+
+static int ensure_directory_exists(const char *path)
+{
+    struct stat st;
+
+    if (!path || !*path) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (stat(path, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            errno = ENOTDIR;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (errno != ENOENT)
+        return -1;
+
+    if (mkdir(path, 0775) < 0)
+        return -1;
+
+    return 0;
+}
+
+static int copy_file(const char *src, const char *dst)
+{
+    int in_fd = -1, out_fd = -1;
+    char buf[8192];
+    ssize_t r;
+
+    in_fd = open(src, O_RDONLY);
+    if (in_fd < 0)
+        return -1;
+
+    out_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+    if (out_fd < 0) {
+        close(in_fd);
+        return -1;
+    }
+
+    while ((r = read(in_fd, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < r) {
+            ssize_t w = write(out_fd, buf + off, r - off);
+            if (w < 0) {
+                close(in_fd);
+                close(out_fd);
+                return -1;
+            }
+            off += w;
+        }
+    }
+
+    if (r < 0) {
+        close(in_fd);
+        close(out_fd);
+        return -1;
+    }
+
+    if (fsync(out_fd) < 0) {
+        close(in_fd);
+        close(out_fd);
+        return -1;
+    }
+
+    close(in_fd);
+    close(out_fd);
+    return 0;
+}
+
+static int move_file_to_dir(const char *src_path, const char *output_dir)
+{
+    char dst_path[PATH_MAX];
+    const char *base;
+    const char *slash;
+
+    if (!src_path || !*src_path || !output_dir || !*output_dir) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    slash = strrchr(src_path, '/');
+    base = slash ? slash + 1 : src_path;
+
+    if (snprintf(dst_path, sizeof(dst_path), "%s/%s", output_dir, base) >= (int)sizeof(dst_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (rename(src_path, dst_path) == 0)
+        return 0;
+
+    if (errno != EXDEV)
+        return -1;
+
+    if (copy_file(src_path, dst_path) < 0)
+        return -1;
+
+    if (unlink(src_path) < 0)
+        return -1;
+
+    return 0;
 }
 
 static int create_control_socket(const char *path)
@@ -203,7 +312,9 @@ static void strtrim(char *s)
 static void stop_recording(bool *recording,
                            FILE **fout,
                            snd_pcm_t *pcm,
-                           long *frames_recorded)
+                           long *frames_recorded,
+                           char *current_filename,
+                           const char *output_dir)
 {
     if (*recording && *fout) {
         fflush(*fout);
@@ -215,6 +326,16 @@ static void stop_recording(bool *recording,
 
         snd_pcm_drop(pcm);
         snd_pcm_prepare(pcm);
+
+        if (current_filename && *current_filename && output_dir && *output_dir) {
+            if (move_file_to_dir(current_filename, output_dir) < 0) {
+                log_error("[%d] Failed to move %s to %s: %s",
+                          getpid(), current_filename, output_dir, strerror(errno));
+            } else {
+                log_info("[%d] Moved file to %s", getpid(), output_dir);
+                current_filename[0] = '\0';
+            }
+        }
     }
 }
 
@@ -224,7 +345,9 @@ static void start_recording(bool *recording,
                             int mode,
                             int bits_per_frame,
                             int samples_per_frame,
-                            long *frames_recorded)
+                            long *frames_recorded,
+                            char *current_filename,
+                            size_t current_filename_len)
 {
     char filename[64];
     struct c2_header hdr;
@@ -236,10 +359,16 @@ static void start_recording(bool *recording,
     snd_pcm_prepare(pcm);
 
     make_timestamp_filename(filename, sizeof(filename));
+
+    if (current_filename && current_filename_len > 0)
+        snprintf(current_filename, current_filename_len, "%s", filename);
+
     *fout = fopen(filename, "wb");
     if (!*fout) {
         log_error("[%d] fopen(%s) failed: %s",
                   getpid(), filename, strerror(errno));
+        if (current_filename && current_filename_len > 0)
+            current_filename[0] = '\0';
         return;
     }
 
@@ -252,6 +381,8 @@ static void start_recording(bool *recording,
         log_error("[%d] Failed to write header to %s", getpid(), filename);
         fclose(*fout);
         *fout = NULL;
+        if (current_filename && current_filename_len > 0)
+            current_filename[0] = '\0';
         return;
     }
 
@@ -267,7 +398,9 @@ static void handle_ptt_down(int *state,
                             int mode,
                             int bits_per_frame,
                             int samples_per_frame,
-                            long *frames_recorded)
+                            long *frames_recorded,
+                            char *current_filename,
+                            size_t current_filename_len)
 {
     if (*state == 0) {
         log_info("[%d] PTT down", getpid());
@@ -276,7 +409,8 @@ static void handle_ptt_down(int *state,
 
     if (!*recording) {
         start_recording(recording, fout, pcm, mode,
-                        bits_per_frame, samples_per_frame, frames_recorded);
+                        bits_per_frame, samples_per_frame, frames_recorded,
+                        current_filename, current_filename_len);
     }
 }
 
@@ -284,14 +418,17 @@ static void handle_ptt_up(int *state,
                           bool *recording,
                           FILE **fout,
                           snd_pcm_t *pcm,
-                          long *frames_recorded)
+                          long *frames_recorded,
+                          char *current_filename,
+                          const char *output_dir)
 {
     if (*state == 1) {
         log_info("[%d] PTT up", getpid());
         *state = 0;
     }
 
-    stop_recording(recording, fout, pcm, frames_recorded);
+    stop_recording(recording, fout, pcm, frames_recorded,
+                   current_filename, output_dir);
 }
 
 static void process_socket_command(const char *cmd,
@@ -302,16 +439,21 @@ static void process_socket_command(const char *cmd,
                                    int mode,
                                    int bits_per_frame,
                                    int samples_per_frame,
-                                   long *frames_recorded)
+                                   long *frames_recorded,
+                                   char *current_filename,
+                                   size_t current_filename_len,
+                                   const char *output_dir)
 {
     if (!cmd)
         return;
 
     if (strcmp(cmd, "ptt_down") == 0) {
         handle_ptt_down(state, recording, fout, pcm, mode,
-                        bits_per_frame, samples_per_frame, frames_recorded);
+                        bits_per_frame, samples_per_frame, frames_recorded,
+                        current_filename, current_filename_len);
     } else if (strcmp(cmd, "ptt_up") == 0) {
-        handle_ptt_up(state, recording, fout, pcm, frames_recorded);
+        handle_ptt_up(state, recording, fout, pcm, frames_recorded,
+                      current_filename, output_dir);
     } else {
         log_error("[%d] Unknown socket command: '%s'", getpid(), cmd);
     }
@@ -340,6 +482,8 @@ int main(int argc, char *argv[])
     char *socket_path = NULL;
     char *enable_keyboard_s = NULL;
     char *enable_socket_s = NULL;
+    char *output_dir = NULL;
+    char current_filename[PATH_MAX] = {0};
 
     int enable_keyboard = 1;
     int enable_socket = 0;
@@ -399,6 +543,7 @@ int main(int argc, char *argv[])
     ini_sget(config, "pttkey", "socket_path", NULL, &socket_path);
     ini_sget(config, "pttkey", "enable_keyboard", NULL, &enable_keyboard_s);
     ini_sget(config, "pttkey", "enable_socket", NULL, &enable_socket_s);
+    ini_sget(config, "pttkey", "output_dir", NULL, &output_dir);
 
     enable_keyboard = parse_ini_int(enable_keyboard_s, 1);
     enable_socket   = parse_ini_int(enable_socket_s, 0);
@@ -412,6 +557,19 @@ int main(int argc, char *argv[])
 
     if (!enable_keyboard && !enable_socket) {
         log_error("[%d] Both enable_keyboard and enable_socket are disabled", getpid());
+        ini_free(config);
+        exit(1);
+    }
+
+    if (!output_dir || !*output_dir) {
+        log_error("[%d] output_dir not set in pttkey.ini", getpid());
+        ini_free(config);
+        exit(1);
+    }
+
+    if (ensure_directory_exists(output_dir) < 0) {
+        log_error("[%d] Cannot use output_dir %s: %s",
+                  getpid(), output_dir, strerror(errno));
         ini_free(config);
         exit(1);
     }
@@ -455,7 +613,6 @@ int main(int argc, char *argv[])
         log_info("[%d] Socket control listening on %s", getpid(), g_socket_path);
     }
 
-    /* Codec2 init */
     int mode = CODEC2_MODE_2400;
     c2 = codec2_create(mode);
     if (!c2) {
@@ -481,7 +638,6 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    /* ALSA capture init */
     if ((err = snd_pcm_open(&pcm, DEVICE, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
         log_error("[%d] snd_pcm_open (capture) failed: %s", getpid(), snd_strerror(err));
         free(speech);
@@ -568,7 +724,6 @@ int main(int argc, char *argv[])
             usleep(50000);
         }
 
-        /* Keyboard events */
         if (keyboard_fd != -1) {
             while (read(keyboard_fd, &keyboard_event, sizeof(keyboard_event)) == sizeof(keyboard_event)) {
                 if (state == 0 &&
@@ -577,7 +732,8 @@ int main(int argc, char *argv[])
                     keyboard_event.value == ptt_down_value) {
 
                     handle_ptt_down(&state, &recording, &fout, pcm, mode,
-                                    bits_per_frame, samples_per_frame, &frames_recorded);
+                                    bits_per_frame, samples_per_frame, &frames_recorded,
+                                    current_filename, sizeof(current_filename));
                 }
 
                 if (state == 1 &&
@@ -585,12 +741,12 @@ int main(int argc, char *argv[])
                     keyboard_event.code  == ptt_up_code &&
                     keyboard_event.value == ptt_up_value) {
 
-                    handle_ptt_up(&state, &recording, &fout, pcm, &frames_recorded);
+                    handle_ptt_up(&state, &recording, &fout, pcm, &frames_recorded,
+                                  current_filename, output_dir);
                 }
             }
         }
 
-        /* Socket commands */
         if (g_socket_fd != -1) {
             for (;;) {
                 int cfd;
@@ -610,7 +766,8 @@ int main(int argc, char *argv[])
                     buf[n] = '\0';
                     strtrim(buf);
                     process_socket_command(buf, &state, &recording, &fout, pcm, mode,
-                                           bits_per_frame, samples_per_frame, &frames_recorded);
+                                           bits_per_frame, samples_per_frame, &frames_recorded,
+                                           current_filename, sizeof(current_filename), output_dir);
                 }
 
                 close(cfd);
@@ -620,7 +777,8 @@ int main(int argc, char *argv[])
         if (recording && fout) {
             if ((err = record_frame(pcm, speech, samples_per_frame)) < 0) {
                 log_error("[%d] record_frame failed, stopping recording", getpid());
-                stop_recording(&recording, &fout, pcm, &frames_recorded);
+                stop_recording(&recording, &fout, pcm, &frames_recorded,
+                               current_filename, output_dir);
                 continue;
             }
 
@@ -628,7 +786,8 @@ int main(int argc, char *argv[])
 
             if (fwrite(bits, bytes_per_frame, 1, fout) != 1) {
                 log_error("[%d] fwrite failed, stopping recording", getpid());
-                stop_recording(&recording, &fout, pcm, &frames_recorded);
+                stop_recording(&recording, &fout, pcm, &frames_recorded,
+                               current_filename, output_dir);
                 continue;
             }
 
@@ -639,7 +798,8 @@ int main(int argc, char *argv[])
     log_info("[%d] Exiting", getpid());
 
     if (recording && fout)
-        stop_recording(&recording, &fout, pcm, &frames_recorded);
+        stop_recording(&recording, &fout, pcm, &frames_recorded,
+                       current_filename, output_dir);
 
     if (keyboard_fd != -1)
         close(keyboard_fd);
