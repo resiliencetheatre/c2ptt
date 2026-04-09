@@ -1,4 +1,5 @@
 *.c2
 play_spool
 pttkey_rec
+pttkey_ctrl
 *.o

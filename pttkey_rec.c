@@ -18,12 +18,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
  * MA 02110-1301, USA.
  *
- *
  * sudo apt install libcodec2-dev libasound2-dev
- * 
+ *
  * Ini file template:
  *
  * [pttkey]
+ * enable_keyboard=1
  * keyboard_device=/dev/input/event0
  * ptt_down_type = 1
  * ptt_down_code = 100
@@ -32,6 +32,12 @@
  * ptt_up_code = 100
  * ptt_up_value = 0
  *
+ * enable_socket=1
+ * socket_path=/tmp/pttkey.sock
+ *
+ * Socket commands:
+ *   ptt_down
+ *   ptt_up
  */
 
 #include <stdio.h>
@@ -49,22 +55,50 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <signal.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
 #include <alsa/asoundlib.h>
 #include <codec2/codec2.h>
 
 #include "log.h"
 #include "ini.h"
 
-#define DEVICE      "default"   /* ALSA capture device, "default" or "plughw:0,0" */
+#define DEVICE      "default"
 #define SAMPLE_RATE 8000
 #define CHANNELS    1
 
 struct c2_header {
-    char     magic[4];           // "C2BF"
-    uint32_t mode;               // Codec2 mode (e.g. CODEC2_MODE_1300)
+    char     magic[4];           /* "C2BF" */
+    uint32_t mode;
     uint32_t bits_per_frame;
     uint32_t samples_per_frame;
 };
+
+static volatile sig_atomic_t g_running = 1;
+static char g_socket_path[108] = {0};
+static int g_socket_fd = -1;
+
+static void signal_handler(int sig)
+{
+    (void)sig;
+    g_running = 0;
+}
+
+static void cleanup_socket(void)
+{
+    if (g_socket_fd != -1) {
+        close(g_socket_fd);
+        g_socket_fd = -1;
+    }
+
+    if (g_socket_path[0] != '\0') {
+        unlink(g_socket_path);
+        g_socket_path[0] = '\0';
+    }
+}
 
 static int record_frame(snd_pcm_t *handle, short *buf, int frames)
 {
@@ -72,7 +106,6 @@ static int record_frame(snd_pcm_t *handle, short *buf, int frames)
     while (got < frames) {
         int r = snd_pcm_readi(handle, buf + got, frames - got);
         if (r == -EPIPE) {
-            // overrun
             snd_pcm_prepare(handle);
             continue;
         } else if (r < 0) {
@@ -84,7 +117,6 @@ static int record_frame(snd_pcm_t *handle, short *buf, int frames)
     return 0;
 }
 
-/* Create a timestamped filename like rec-YYYYMMDD-HHMMSS.c2 */
 static void make_timestamp_filename(char *buf, size_t len)
 {
     time_t t = time(NULL);
@@ -93,9 +125,237 @@ static void make_timestamp_filename(char *buf, size_t len)
     strftime(buf, len, "rec-%Y%m%d-%H%M%S.c2", &tm);
 }
 
+static int parse_ini_int(const char *s, int defval)
+{
+    if (!s || !*s)
+        return defval;
+    return atoi(s);
+}
+
+static int create_control_socket(const char *path)
+{
+    int fd;
+    struct sockaddr_un addr;
+
+    if (!path || !*path) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+    unlink(path);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (listen(fd, 8) < 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    return fd;
+}
+
+static void strtrim(char *s)
+{
+    char *p;
+    size_t len;
+
+    if (!s || !*s)
+        return;
+
+    while (isspace((unsigned char)*s))
+        memmove(s, s + 1, strlen(s));
+
+    len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[len - 1] = '\0';
+        len--;
+    }
+
+    p = strchr(s, '\r');
+    if (p) *p = '\0';
+    p = strchr(s, '\n');
+    if (p) *p = '\0';
+}
+
+static void stop_recording(bool *recording,
+                           FILE **fout,
+                           snd_pcm_t *pcm,
+                           long *frames_recorded)
+{
+    if (*recording && *fout) {
+        fflush(*fout);
+        fclose(*fout);
+        *fout = NULL;
+        *recording = false;
+
+        log_info("[%d] Stopped recording, codec2_frames=%ld", getpid(), *frames_recorded);
+
+        snd_pcm_drop(pcm);
+        snd_pcm_prepare(pcm);
+    }
+}
+
+static void start_recording(bool *recording,
+                            FILE **fout,
+                            snd_pcm_t *pcm,
+                            int mode,
+                            int bits_per_frame,
+                            int samples_per_frame,
+                            long *frames_recorded)
+{
+    char filename[64];
+    struct c2_header hdr;
+
+    if (*recording)
+        return;
+
+    snd_pcm_drop(pcm);
+    snd_pcm_prepare(pcm);
+
+    make_timestamp_filename(filename, sizeof(filename));
+    *fout = fopen(filename, "wb");
+    if (!*fout) {
+        log_error("[%d] fopen(%s) failed: %s",
+                  getpid(), filename, strerror(errno));
+        return;
+    }
+
+    memcpy(hdr.magic, "C2BF", 4);
+    hdr.mode              = (uint32_t)mode;
+    hdr.bits_per_frame    = (uint32_t)bits_per_frame;
+    hdr.samples_per_frame = (uint32_t)samples_per_frame;
+
+    if (fwrite(&hdr, sizeof(hdr), 1, *fout) != 1) {
+        log_error("[%d] Failed to write header to %s", getpid(), filename);
+        fclose(*fout);
+        *fout = NULL;
+        return;
+    }
+
+    *recording = true;
+    *frames_recorded = 0;
+    log_info("[%d] Started recording to %s", getpid(), filename);
+}
+
+static void handle_ptt_down(int *state,
+                            bool *recording,
+                            FILE **fout,
+                            snd_pcm_t *pcm,
+                            int mode,
+                            int bits_per_frame,
+                            int samples_per_frame,
+                            long *frames_recorded)
+{
+    if (*state == 0) {
+        log_info("[%d] PTT down", getpid());
+        *state = 1;
+    }
+
+    if (!*recording) {
+        start_recording(recording, fout, pcm, mode,
+                        bits_per_frame, samples_per_frame, frames_recorded);
+    }
+}
+
+static void handle_ptt_up(int *state,
+                          bool *recording,
+                          FILE **fout,
+                          snd_pcm_t *pcm,
+                          long *frames_recorded)
+{
+    if (*state == 1) {
+        log_info("[%d] PTT up", getpid());
+        *state = 0;
+    }
+
+    stop_recording(recording, fout, pcm, frames_recorded);
+}
+
+static void process_socket_command(const char *cmd,
+                                   int *state,
+                                   bool *recording,
+                                   FILE **fout,
+                                   snd_pcm_t *pcm,
+                                   int mode,
+                                   int bits_per_frame,
+                                   int samples_per_frame,
+                                   long *frames_recorded)
+{
+    if (!cmd)
+        return;
+
+    if (strcmp(cmd, "ptt_down") == 0) {
+        handle_ptt_down(state, recording, fout, pcm, mode,
+                        bits_per_frame, samples_per_frame, frames_recorded);
+    } else if (strcmp(cmd, "ptt_up") == 0) {
+        handle_ptt_up(state, recording, fout, pcm, frames_recorded);
+    } else {
+        log_error("[%d] Unknown socket command: '%s'", getpid(), cmd);
+    }
+}
+
 int main(int argc, char *argv[])
 {
     int opt;
+    int state = 0;
+    int rcode = 0;
+    int err;
+    char keyboard_name[256] = "Unknown";
+
+    int keyboard_fd = -1;
+    struct input_event keyboard_event;
+
+    char *keyboard_device = NULL;
+    char *ptt_down_command = NULL;
+    char *ptt_up_command   = NULL;
+    char *ptt_down_type_s = NULL;
+    char *ptt_down_code_s = NULL;
+    char *ptt_down_value_s = NULL;
+    char *ptt_up_type_s = NULL;
+    char *ptt_up_code_s = NULL;
+    char *ptt_up_value_s = NULL;
+    char *socket_path = NULL;
+    char *enable_keyboard_s = NULL;
+    char *enable_socket_s = NULL;
+
+    int enable_keyboard = 1;
+    int enable_socket = 0;
+    int ptt_down_type, ptt_down_code, ptt_down_value;
+    int ptt_up_type, ptt_up_code, ptt_up_value;
+
+    snd_pcm_t *pcm = NULL;
+    snd_pcm_hw_params_t *params;
+    struct CODEC2 *c2 = NULL;
+    short *speech = NULL;
+    unsigned char *bits = NULL;
+
+    bool recording = false;
+    FILE *fout = NULL;
+    long frames_recorded = 0;
+
     log_set_level(LOG_INFO);
     log_set_quiet(1);
 
@@ -106,7 +366,6 @@ int main(int argc, char *argv[])
             fprintf(stderr, "\n Options: -l enable logging\n");
             fprintf(stderr, "          -d set log level to debug\n\n");
             exit(0);
-            break;
         case 'l':
             log_set_quiet(0);
             break;
@@ -118,57 +377,91 @@ int main(int argc, char *argv[])
         }
     }
 
-    int state = 0;
-    int rcode = 0;
-    char keyboard_name[256] = "Unknown";
-    char *keyboard_device = NULL;
-    char *ptt_down_command = NULL; /* unused but kept for ini compatibility */
-    char *ptt_up_command   = NULL; /* unused but kept for ini compatibility */
-    char *ptt_down_type, *ptt_down_code, *ptt_down_value;
-    char *ptt_up_type,   *ptt_up_code,   *ptt_up_value;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGQUIT, signal_handler);
 
-    /* Read ini-file */
     ini_t *config = ini_load("pttkey.ini");
     if (config == NULL) {
         log_error("[%d] Cannot find pttkey.ini, aborting.", getpid());
         exit(1);
     }
+
     ini_sget(config, "pttkey", "keyboard_device", NULL, &keyboard_device);
     ini_sget(config, "pttkey", "ptt_down_command", NULL, &ptt_down_command);
     ini_sget(config, "pttkey", "ptt_up_command", NULL, &ptt_up_command);
-    ini_sget(config, "pttkey", "ptt_down_type", NULL, &ptt_down_type);
-    ini_sget(config, "pttkey", "ptt_down_code", NULL, &ptt_down_code);
-    ini_sget(config, "pttkey", "ptt_down_value", NULL, &ptt_down_value);
-    ini_sget(config, "pttkey", "ptt_up_type", NULL, &ptt_up_type);
-    ini_sget(config, "pttkey", "ptt_up_code", NULL, &ptt_up_code);
-    ini_sget(config, "pttkey", "ptt_up_value", NULL, &ptt_up_value);
+    ini_sget(config, "pttkey", "ptt_down_type", NULL, &ptt_down_type_s);
+    ini_sget(config, "pttkey", "ptt_down_code", NULL, &ptt_down_code_s);
+    ini_sget(config, "pttkey", "ptt_down_value", NULL, &ptt_down_value_s);
+    ini_sget(config, "pttkey", "ptt_up_type", NULL, &ptt_up_type_s);
+    ini_sget(config, "pttkey", "ptt_up_code", NULL, &ptt_up_code_s);
+    ini_sget(config, "pttkey", "ptt_up_value", NULL, &ptt_up_value_s);
+    ini_sget(config, "pttkey", "socket_path", NULL, &socket_path);
+    ini_sget(config, "pttkey", "enable_keyboard", NULL, &enable_keyboard_s);
+    ini_sget(config, "pttkey", "enable_socket", NULL, &enable_socket_s);
 
-    if (!keyboard_device) {
-        log_error("[%d] keyboard_device not set in pttkey.ini", getpid());
+    enable_keyboard = parse_ini_int(enable_keyboard_s, 1);
+    enable_socket   = parse_ini_int(enable_socket_s, 0);
+
+    ptt_down_type  = parse_ini_int(ptt_down_type_s, 1);
+    ptt_down_code  = parse_ini_int(ptt_down_code_s, 100);
+    ptt_down_value = parse_ini_int(ptt_down_value_s, 1);
+    ptt_up_type    = parse_ini_int(ptt_up_type_s, 1);
+    ptt_up_code    = parse_ini_int(ptt_up_code_s, 100);
+    ptt_up_value   = parse_ini_int(ptt_up_value_s, 0);
+
+    if (!enable_keyboard && !enable_socket) {
+        log_error("[%d] Both enable_keyboard and enable_socket are disabled", getpid());
         ini_free(config);
         exit(1);
     }
 
-    /* Open keyboard */
-    int keyboard_fd = open(keyboard_device, O_RDONLY | O_NONBLOCK);
-    if (keyboard_fd == -1) {
-        log_error("[%d] Failed to open keyboard %s. Are you in input group?",
-                  getpid(), keyboard_device);
-        ini_free(config);
-        exit(1);
+    if (enable_keyboard) {
+        if (!keyboard_device || !*keyboard_device) {
+            log_error("[%d] enable_keyboard=1 but keyboard_device not set", getpid());
+            ini_free(config);
+            exit(1);
+        }
+
+        keyboard_fd = open(keyboard_device, O_RDONLY | O_NONBLOCK);
+        if (keyboard_fd == -1) {
+            log_error("[%d] Failed to open keyboard %s. Are you in input group?",
+                      getpid(), keyboard_device);
+            ini_free(config);
+            exit(1);
+        }
+
+        rcode = ioctl(keyboard_fd, EVIOCGNAME(sizeof(keyboard_name)), keyboard_name);
+        (void)rcode;
+        log_debug("[%d] Monitoring %s", getpid(), keyboard_name);
+        log_info("[%d] Keyboard open %s", getpid(), keyboard_device);
     }
-    rcode = ioctl(keyboard_fd, EVIOCGNAME(sizeof(keyboard_name)), keyboard_name);
-    log_debug("[%d] Monitoring %s (%d)", getpid(), keyboard_name, rcode);
-    struct input_event keyboard_event;
 
-    log_info("[%d] Keyboard open %s", getpid(), keyboard_device);
+    if (enable_socket) {
+        if (!socket_path || !*socket_path)
+            socket_path = "/tmp/pttkey.sock";
 
-    /* ---- Codec2 init ---- */
+        snprintf(g_socket_path, sizeof(g_socket_path), "%s", socket_path);
+        g_socket_fd = create_control_socket(g_socket_path);
+        if (g_socket_fd < 0) {
+            log_error("[%d] Failed to create control socket %s: %s",
+                      getpid(), g_socket_path, strerror(errno));
+            if (keyboard_fd != -1)
+                close(keyboard_fd);
+            ini_free(config);
+            exit(1);
+        }
+
+        log_info("[%d] Socket control listening on %s", getpid(), g_socket_path);
+    }
+
+    /* Codec2 init */
     int mode = CODEC2_MODE_2400;
-    struct CODEC2 *c2 = codec2_create(mode);
+    c2 = codec2_create(mode);
     if (!c2) {
         log_error("[%d] codec2_create failed", getpid());
-        close(keyboard_fd);
+        cleanup_socket();
+        if (keyboard_fd != -1) close(keyboard_fd);
         ini_free(config);
         exit(1);
     }
@@ -177,27 +470,25 @@ int main(int argc, char *argv[])
     int bits_per_frame    = codec2_bits_per_frame(c2);
     int bytes_per_frame   = (bits_per_frame + 7) / 8;
 
-    short *speech = malloc(samples_per_frame * sizeof(short));
-    unsigned char *bits = malloc(bytes_per_frame);
+    speech = malloc(samples_per_frame * sizeof(short));
+    bits   = malloc(bytes_per_frame);
     if (!speech || !bits) {
         log_error("[%d] malloc failed", getpid());
         codec2_destroy(c2);
-        close(keyboard_fd);
+        cleanup_socket();
+        if (keyboard_fd != -1) close(keyboard_fd);
         ini_free(config);
         exit(1);
     }
 
-    /* ---- ALSA capture init ---- */
-    snd_pcm_t *pcm = NULL;
-    snd_pcm_hw_params_t *params;
-    int err;
-
+    /* ALSA capture init */
     if ((err = snd_pcm_open(&pcm, DEVICE, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
         log_error("[%d] snd_pcm_open (capture) failed: %s", getpid(), snd_strerror(err));
         free(speech);
         free(bits);
         codec2_destroy(c2);
-        close(keyboard_fd);
+        cleanup_socket();
+        if (keyboard_fd != -1) close(keyboard_fd);
         ini_free(config);
         exit(1);
     }
@@ -217,11 +508,12 @@ int main(int argc, char *argv[])
         log_error("[%d] ALSA could not set requested sample rate %d Hz, got %u Hz",
                   getpid(), SAMPLE_RATE, rate);
         log_error("[%d] This will break Codec2 timing, aborting.", getpid());
+        snd_pcm_close(pcm);
         free(speech);
         free(bits);
         codec2_destroy(c2);
-        snd_pcm_close(pcm);
-        close(keyboard_fd);
+        cleanup_socket();
+        if (keyboard_fd != -1) close(keyboard_fd);
         ini_free(config);
         exit(1);
     }
@@ -231,11 +523,12 @@ int main(int argc, char *argv[])
 
     if ((err = snd_pcm_hw_params(pcm, params)) < 0) {
         log_error("[%d] snd_pcm_hw_params (capture) failed: %s", getpid(), snd_strerror(err));
+        snd_pcm_close(pcm);
         free(speech);
         free(bits);
         codec2_destroy(c2);
-        snd_pcm_close(pcm);
-        close(keyboard_fd);
+        cleanup_socket();
+        if (keyboard_fd != -1) close(keyboard_fd);
         ini_free(config);
         exit(1);
     }
@@ -244,86 +537,90 @@ int main(int argc, char *argv[])
     log_info("[%d] Codec2: samples/frame=%d, bits/frame=%d, bytes/frame=%d",
              getpid(), samples_per_frame, bits_per_frame, bytes_per_frame);
 
-    /* ---- Recording state ---- */
-    bool recording = false;
-    FILE *fout = NULL;
-    long frames_recorded = 0;
+    while (g_running) {
+        struct pollfd pfds[2];
+        nfds_t nfds = 0;
+        int poll_timeout = recording ? 0 : 50;
 
-    while (1) {
-        /* Read all available keyboard events (non-blocking) */
-        while (read(keyboard_fd, &keyboard_event, sizeof(keyboard_event)) != -1) {
-            /* PTT down */
-            if (state == 0 &&
-                keyboard_event.type  == atoi(ptt_down_type) &&
-                keyboard_event.code  == atoi(ptt_down_code) &&
-                keyboard_event.value == atoi(ptt_down_value)) {
+        if (keyboard_fd != -1) {
+            pfds[nfds].fd = keyboard_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
 
-                log_info("[%d] PTT down", getpid());
-                state = 1;
+        if (g_socket_fd != -1) {
+            pfds[nfds].fd = g_socket_fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
 
-                if (!recording) {
-                    /* FLUSH ALSA CAPTURE BUFFER */
-                    snd_pcm_drop(pcm);      // stop and drop all pending frames
-                    snd_pcm_prepare(pcm);   // restart in a clean state
-
-                    char filename[64];
-                    make_timestamp_filename(filename, sizeof(filename));
-                    fout = fopen(filename, "wb");
-                    if (!fout) {
-                        log_error("[%d] fopen(%s) failed: %s",
-                                  getpid(), filename, strerror(errno));
-                    } else {
-                        struct c2_header hdr;
-                        memcpy(hdr.magic, "C2BF", 4);
-                        hdr.mode              = (uint32_t)mode;
-                        hdr.bits_per_frame    = (uint32_t)bits_per_frame;
-                        hdr.samples_per_frame = (uint32_t)samples_per_frame;
-
-                        if (fwrite(&hdr, sizeof(hdr), 1, fout) != 1) {
-                            log_error("[%d] Failed to write header to %s",
-                                      getpid(), filename);
-                            fclose(fout);
-                            fout = NULL;
-                        } else {
-                            recording = true;
-                            frames_recorded = 0;
-                            log_info("[%d] Started recording to %s", getpid(), filename);
-                        }
-                    }
-                }
+        if (nfds > 0) {
+            int pr = poll(pfds, nfds, poll_timeout);
+            if (pr < 0) {
+                if (errno == EINTR)
+                    continue;
+                log_error("[%d] poll failed: %s", getpid(), strerror(errno));
+                break;
             }
+        } else {
+            usleep(50000);
+        }
 
-            /* PTT release */
-            if (state == 1 &&
-                keyboard_event.type  == atoi(ptt_up_type) &&
-                keyboard_event.code  == atoi(ptt_up_code) &&
-                keyboard_event.value == atoi(ptt_up_value)) {
+        /* Keyboard events */
+        if (keyboard_fd != -1) {
+            while (read(keyboard_fd, &keyboard_event, sizeof(keyboard_event)) == sizeof(keyboard_event)) {
+                if (state == 0 &&
+                    keyboard_event.type  == ptt_down_type &&
+                    keyboard_event.code  == ptt_down_code &&
+                    keyboard_event.value == ptt_down_value) {
 
-                log_info("[%d] PTT up", getpid());
-                state = 0;
+                    handle_ptt_down(&state, &recording, &fout, pcm, mode,
+                                    bits_per_frame, samples_per_frame, &frames_recorded);
+                }
 
-                if (recording && fout) {
-                    fflush(fout);
-                    fclose(fout);
-                    fout = NULL;
-                    recording = false;
-                    log_info("[%d] Stopped recording, frames=%ld", getpid(), frames_recorded);
+                if (state == 1 &&
+                    keyboard_event.type  == ptt_up_type &&
+                    keyboard_event.code  == ptt_up_code &&
+                    keyboard_event.value == ptt_up_value) {
 
-                    /* Optional: reset ALSA  */
-                    snd_pcm_drop(pcm);
-                    snd_pcm_prepare(pcm);
+                    handle_ptt_up(&state, &recording, &fout, pcm, &frames_recorded);
                 }
             }
         }
 
+        /* Socket commands */
+        if (g_socket_fd != -1) {
+            for (;;) {
+                int cfd;
+                char buf[128];
+                ssize_t n;
+
+                cfd = accept(g_socket_fd, NULL, NULL);
+                if (cfd < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                        break;
+                    log_error("[%d] accept failed: %s", getpid(), strerror(errno));
+                    break;
+                }
+
+                n = read(cfd, buf, sizeof(buf) - 1);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    strtrim(buf);
+                    process_socket_command(buf, &state, &recording, &fout, pcm, mode,
+                                           bits_per_frame, samples_per_frame, &frames_recorded);
+                }
+
+                close(cfd);
+            }
+        }
+
         if (recording && fout) {
-            /* Record one Codec2 frame worth of audio */
             if ((err = record_frame(pcm, speech, samples_per_frame)) < 0) {
                 log_error("[%d] record_frame failed, stopping recording", getpid());
-                fflush(fout);
-                fclose(fout);
-                fout = NULL;
-                recording = false;
+                stop_recording(&recording, &fout, pcm, &frames_recorded);
                 continue;
             }
 
@@ -331,28 +628,32 @@ int main(int argc, char *argv[])
 
             if (fwrite(bits, bytes_per_frame, 1, fout) != 1) {
                 log_error("[%d] fwrite failed, stopping recording", getpid());
-                fflush(fout);
-                fclose(fout);
-                fout = NULL;
-                recording = false;
+                stop_recording(&recording, &fout, pcm, &frames_recorded);
                 continue;
             }
 
-            frames_recorded += samples_per_frame;
-        } else {
-            usleep(10000); // 10 ms
+            frames_recorded++;
         }
     }
 
-    /* Not really reached */
     log_info("[%d] Exiting", getpid());
-    rcode = ioctl(keyboard_fd, EVIOCGRAB, 1);
-    (void)rcode;
-    close(keyboard_fd);
-    snd_pcm_close(pcm);
-    codec2_destroy(c2);
+
+    if (recording && fout)
+        stop_recording(&recording, &fout, pcm, &frames_recorded);
+
+    if (keyboard_fd != -1)
+        close(keyboard_fd);
+
+    if (pcm)
+        snd_pcm_close(pcm);
+
+    if (c2)
+        codec2_destroy(c2);
+
     free(speech);
     free(bits);
+    cleanup_socket();
     ini_free(config);
+
     return 0;
 }
